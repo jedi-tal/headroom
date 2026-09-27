@@ -179,10 +179,10 @@ export class HeadroomContextEngine {
       return {
         messages: compressedAgentMessages,
         estimatedTokens: result.tokensAfter,
-        systemPromptAddition:
-          result.tokensSaved > 100
-            ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Use headroom_retrieve with the hash to get full details.]`
-            : undefined,
+        // No system-prompt note. openclaw puts it in the dynamic system-prompt suffix, which comes before every
+        // message, so the note appearing (or its count changing) invalidates the provider's message cache on the
+        // turn it changes. Upstream: headroomlabs-ai/headroom#3811 (static note / announceCompression opt-out).
+        systemPromptAddition: undefined,
       };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
