@@ -213,7 +213,8 @@ export class HeadroomContextEngine {
 
   /** True while the newest message in the history is younger than `skipCompressionWhenCacheWarmMs`. */
   private isCacheWarm(messages: any[]): boolean {
-    const windowMs = this.config.skipCompressionWhenCacheWarmMs ?? 0;
+    // jedify deploy default: Bedrock's 5-minute prompt-cache TTL. Upstream the option defaults to off.
+    const windowMs = this.config.skipCompressionWhenCacheWarmMs ?? 300_000;
     if (!(windowMs > 0)) return false;
     let newest = 0;
     for (const message of messages) {

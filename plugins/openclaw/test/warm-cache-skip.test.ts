@@ -90,11 +90,21 @@ describe("skipCompressionWhenCacheWarmMs", () => {
     expect(result.messages[2].content).toEqual([{ type: "text", text: "[compressed]" }]);
   });
 
-  it("changes nothing when the option is unset", async () => {
+  it("changes nothing when the option is 0", async () => {
     mocked.compress.mockImplementation(compressing(1000));
 
-    const result = await engine({}).assemble({ sessionId: "s", messages: history(60_000) });
+    const result = await engine({ skipCompressionWhenCacheWarmMs: 0 }).assemble({ sessionId: "s", messages: history(60_000) });
 
     expect(result.messages[2].content).toEqual([{ type: "text", text: "[compressed]" }]);
+  });
+
+  it("defaults to the 5-minute cache TTL on this deploy", async () => {
+    mocked.compress.mockImplementation(compressing(1000));
+    const warm = history(60_000);
+
+    expect((await engine({}).assemble({ sessionId: "s", messages: warm })).messages).toEqual(normalizeAgentMessages(warm));
+    expect((await engine({}).assemble({ sessionId: "s", messages: history(360_000) })).messages[2].content).toEqual([
+      { type: "text", text: "[compressed]" },
+    ]);
   });
 });
