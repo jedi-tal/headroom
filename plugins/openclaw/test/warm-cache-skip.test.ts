@@ -67,7 +67,18 @@ describe("skipCompressionWhenCacheWarmMs", () => {
     const result = await engine({ skipCompressionWhenCacheWarmMs: 300_000 }).assemble({ sessionId: "s", messages: input });
 
     expect(result.messages).toEqual(normalizeAgentMessages(input));
-    expect(result.estimatedTokens).toBe(1000);
+    // The proxy is not called at all, so it never counts savings that are not applied.
+    expect(mocked.compress).not.toHaveBeenCalled();
+  });
+
+  it("asks the proxy when a warm history may be near the budget, and keeps it unchanged if it fits", async () => {
+    mocked.compress.mockImplementation(compressing(1000));
+    const input = history(60_000); // ~4.3K chars, so the high estimate is ~1.4K tokens
+
+    const result = await engine({ skipCompressionWhenCacheWarmMs: 300_000 }).assemble({ sessionId: "s", messages: input, tokenBudget: 1200 });
+
+    expect(mocked.compress).toHaveBeenCalledTimes(1);
+    expect(result.messages).toEqual(normalizeAgentMessages(input)); // the proxy says 1000 tokens: fits 1200
   });
 
   it("applies the compression once the cache has gone cold", async () => {
