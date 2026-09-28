@@ -53,6 +53,12 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   skipCompressionWhenCacheWarmMs?: number;
 }
 
+/** A deliberately high token estimate (3 chars/token): true when the history might be near `tokenBudget`. */
+function mayNeedToShrink(messages: any[], tokenBudget?: number): boolean {
+  if (!tokenBudget) return false;
+  return JSON.stringify(messages).length / 3 > 0.9 * tokenBudget;
+}
+
 export class HeadroomContextEngine {
   readonly info = {
     id: "headroom",
@@ -165,6 +171,12 @@ export class HeadroomContextEngine {
         estimatedTokens: 0,
         systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
       };
+    }
+
+    // Warm cache and clearly within budget: skip without calling the proxy, so it neither counts savings that
+    // are never applied nor adds its latency. Near the budget, ask the proxy and decide on its token count below.
+    if (this.isCacheWarm(params.messages) && !mayNeedToShrink(params.messages, params.tokenBudget)) {
+      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
 
     try {
