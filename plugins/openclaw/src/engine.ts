@@ -36,6 +36,16 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   /** Where to durably record committed turn-advancement keys (see
    * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
   commitLogPath?: string;
+  /**
+   * Skip applying a compression while the provider's prompt cache for this session is still warm, i.e. the
+   * last message in the history is younger than this many ms (0 = never skip). Compressing history the
+   * provider already cached makes it re-write that history at the cache-write rate, to save tokens that
+   * would have been billed at the cache-read rate, so on a warm cache it almost never pays. A cold cache
+   * is re-written anyway, so compressing then is free and shrinks the write. The history is still
+   * compressed when it has to shrink to fit `tokenBudget`. Set it to the provider's cache TTL
+   * (Anthropic/Bedrock default: 300000).
+   */
+  skipCompressionWhenCacheWarmMs?: number;
 }
 
 export class HeadroomContextEngine {
@@ -163,6 +173,15 @@ export class HeadroomContextEngine {
         };
       }
 
+      if (this.isCacheWarm(params.messages) && !(params.tokenBudget && result.tokensBefore > params.tokenBudget)) {
+        this.resetCircuit();
+        this.logger.debug(`Skipped compression on a warm prompt cache (would have saved ${result.tokensSaved})`);
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: result.tokensBefore,
+        };
+      }
+
       // Convert back to AgentMessage format
       const compressedAgentMessages = restoreAgentMessages(params.messages, openaiMessages, result.messages);
       this.resetCircuit();
@@ -190,6 +209,18 @@ export class HeadroomContextEngine {
       // Graceful fallback: return original messages
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
+  }
+
+  /** True while the newest message in the history is younger than `skipCompressionWhenCacheWarmMs`. */
+  private isCacheWarm(messages: any[]): boolean {
+    const windowMs = this.config.skipCompressionWhenCacheWarmMs ?? 0;
+    if (!(windowMs > 0)) return false;
+    let newest = 0;
+    for (const message of messages) {
+      const ts = message?.timestamp;
+      if (typeof ts === "number" && ts > newest) newest = ts;
+    }
+    return newest > 0 && Date.now() - newest < windowMs;
   }
 
   /** Delegate persistent compaction to OpenClaw's built-in runtime. */
