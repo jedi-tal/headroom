@@ -44,7 +44,7 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   announceCompression?: boolean;
   /**
    * Skip applying a compression while the provider's prompt cache for this session is still warm, i.e. the
-   * last message in the history is younger than this many ms (0 = never skip). Compressing history the
+   * newest assistant message in the history is younger than this many ms (0 = never skip). Compressing history the
    * provider already cached makes it re-write that history at the cache-write rate, to save tokens that
    * would have been billed at the cache-read rate, so on a warm cache it almost never pays. A cold cache
    * is re-written anyway, so compressing then is free and shrinks the write. The history is still
@@ -58,10 +58,21 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   skipCompressionWhenCacheWarmMs?: number;
 }
 
-/** A deliberately high token estimate (3 chars/token): true when the history might be near `tokenBudget`. */
-function mayNeedToShrink(messages: any[], tokenBudget?: number): boolean {
-  if (!tokenBudget) return false;
-  return JSON.stringify(messages).length / 3 > 0.9 * tokenBudget;
+/**
+ * UTF-8 size of `messages` as JSON: an upper bound on the proxy's token count for them. Its tokenizers spend at
+ * least one byte of text per token, and the JSON also carries each message's framing. (An image is counted at a
+ * fixed estimate, which its base64 data exceeds unless the image is tiny.)
+ */
+function jsonBytes(messages: any[]): number {
+  return Buffer.byteLength(JSON.stringify(messages), "utf8");
+}
+
+/** The proxy's token count for a session's history, so a warm turn can bound it without asking again. */
+interface TokenCount {
+  /** Fingerprints of the messages counted, in order. */
+  keys: string[];
+  tokens: number;
+  usedAt: number;
 }
 
 /** What a compressing assembly returned, so later assemblies can send the same bytes while the cache is warm. */
@@ -123,6 +134,8 @@ export class HeadroomContextEngine {
   private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
   /** Per session: the compressed view the provider's prompt cache holds (see `unchanged`). */
   private compressedViews = new Map<string, CompressedView>();
+  /** Per session: the proxy's last token count for the history (see `fitsBudget`). */
+  private tokenCounts = new Map<string, TokenCount>();
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -183,6 +196,7 @@ export class HeadroomContextEngine {
     estimatedTokens: number;
     systemPromptAddition?: string;
   }> {
+    this.evictIdle(params.sessionId);
     const warm = this.isCacheWarm(params.messages);
 
     if (!this.proxyUrl || this.config.enabled === false) {
@@ -204,10 +218,14 @@ export class HeadroomContextEngine {
       };
     }
 
-    // Warm cache and clearly within budget: skip without calling the proxy, so it neither counts savings that
-    // are never applied nor adds its latency. Near the budget, ask the proxy and decide on its token count below.
-    if (warm && !mayNeedToShrink(params.messages, params.tokenBudget)) {
-      return { messages: this.unchanged(params, warm), estimatedTokens: 0 };
+    // Warm cache and provably within budget: skip without calling the proxy, so it neither counts savings that
+    // are never applied nor adds its latency. Otherwise ask the proxy and decide on its token count below.
+    if (warm && this.fitsBudget(params)) {
+      return {
+        messages: this.unchanged(params, warm),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     try {
@@ -224,13 +242,7 @@ export class HeadroomContextEngine {
         } as any),
         this.config.requestTimeoutMs ?? 30_000,
       );
-
-      const shouldAnnounceCompression =
-        (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
-        this.config.announceCompression === true;
-      if (shouldAnnounceCompression) {
-        this.markCompressionAnnounced(params.sessionId);
-      }
+      this.rememberTokenCount(params, result.tokensBefore);
 
       if (!result.compressed || result.tokensSaved === 0) {
         this.resetCircuit();
@@ -247,7 +259,16 @@ export class HeadroomContextEngine {
         return {
           messages: this.unchanged(params, warm),
           estimatedTokens: result.tokensBefore,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
         };
+      }
+
+      // Only a compression that is applied earns the notice, so this comes after the warm skip.
+      const shouldAnnounceCompression =
+        (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
+        this.config.announceCompression === true;
+      if (shouldAnnounceCompression) {
+        this.markCompressionAnnounced(params.sessionId);
       }
 
       // Convert back to AgentMessage format
@@ -313,18 +334,13 @@ export class HeadroomContextEngine {
 
   /** Record what a compressing assembly returned in place of `params.messages`, for `unchanged`. */
   private remember(params: { sessionId: string; messages: any[] }, assembled: any[]): void {
-    const windowMs = this.cacheWindowMs();
-    if (!(windowMs > 0)) return;
-    const now = Date.now();
-    for (const [sessionId, view] of this.compressedViews) {
-      if (now - view.usedAt > windowMs) this.compressedViews.delete(sessionId);
-    }
+    if (!(this.cacheWindowMs() > 0)) return;
     try {
       this.compressedViews.set(params.sessionId, {
         sourceKeys: params.messages.map(messageKey),
         viewKeys: assembled.map(messageKey),
         messages: structuredClone(assembled),
-        usedAt: now,
+        usedAt: Date.now(),
       });
     } catch (error) {
       // Not fatal: without a view the next warm assembly sends the originals, which costs one cache re-write.
@@ -333,19 +349,60 @@ export class HeadroomContextEngine {
     }
   }
 
+  /**
+   * True when the history can be shown to fit `tokenBudget` (or there is none) without asking the proxy. The
+   * bound is the proxy's own count from the last time it saw this history plus the size of any messages appended
+   * since, or failing that the size of the whole history (see `jsonBytes`).
+   */
+  private fitsBudget(params: { sessionId: string; messages: any[]; tokenBudget?: number }): boolean {
+    if (!params.tokenBudget) return true;
+    const count = this.tokenCounts.get(params.sessionId);
+    if (count && startsWithKeys(params.messages, count.keys)) {
+      count.usedAt = Date.now();
+      return count.tokens + jsonBytes(params.messages.slice(count.keys.length)) <= params.tokenBudget;
+    }
+    return jsonBytes(params.messages) <= params.tokenBudget;
+  }
+
+  /** Record the proxy's token count for `params.messages`, for `fitsBudget`. */
+  private rememberTokenCount(params: { sessionId: string; messages: any[] }, tokens: number): void {
+    // The SDK's fallback result (proxy unreachable) reports 0 tokens, which is not a count.
+    if (!(this.cacheWindowMs() > 0) || !(tokens > 0)) return;
+    this.tokenCounts.set(params.sessionId, { keys: params.messages.map(messageKey), tokens, usedAt: Date.now() });
+  }
+
+  /**
+   * Drop the views and counts of other sessions that have gone unused for longer than the window: their next
+   * assembly is cold and cannot use them. The current session's are settled by the assembly in progress.
+   */
+  private evictIdle(sessionId: string): void {
+    const windowMs = this.cacheWindowMs();
+    if (!(windowMs > 0)) return;
+    const now = Date.now();
+    for (const entries of [this.compressedViews, this.tokenCounts] as Map<string, { usedAt: number }>[]) {
+      for (const [id, entry] of entries) {
+        if (id !== sessionId && now - entry.usedAt > windowMs) entries.delete(id);
+      }
+    }
+  }
+
   private cacheWindowMs(): number {
     // jedify deploy default: Bedrock's 5-minute prompt-cache TTL. Upstream the option defaults to off.
     return this.config.skipCompressionWhenCacheWarmMs ?? 300_000;
   }
 
-  /** True while the newest message in the history is younger than `skipCompressionWhenCacheWarmMs`. */
+  /**
+   * True while the newest assistant message in the history is younger than `skipCompressionWhenCacheWarmMs`. An
+   * assistant message is stamped when the provider is asked for it, which is the last time the provider read this
+   * prefix. Messages after it, such as the result of a tool that ran for a long time, do not keep the cache warm.
+   */
   private isCacheWarm(messages: any[]): boolean {
     const windowMs = this.cacheWindowMs();
     if (!(windowMs > 0)) return false;
     let newest = 0;
     for (const message of messages) {
       const ts = message?.timestamp;
-      if (typeof ts === "number" && ts > newest) newest = ts;
+      if (message?.role === "assistant" && typeof ts === "number" && ts > newest) newest = ts;
     }
     return newest > 0 && Date.now() - newest < windowMs;
   }

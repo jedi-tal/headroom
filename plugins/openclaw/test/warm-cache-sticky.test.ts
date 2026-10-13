@@ -237,4 +237,42 @@ describe("the compressed history stays put while the prompt cache is warm", () =
     expect(mocked.compress).toHaveBeenCalledTimes(2);
     expect(result.messages[5].content).toEqual(COMPRESSED);
   });
+
+  it("bounds a warm history by the proxy's last count plus what was appended, without asking it again", async () => {
+    mocked.compress.mockImplementation(compressing); // counts 2000 tokens
+    const e = engine();
+    const t1 = turn(10 * MIN, "t1");
+    await e.assemble({ sessionId: "s", messages: t1 });
+
+    // ~9KB in all, too big to fit 7,500 tokens by size alone, but the proxy counted the first ~4.5KB as 2,000 tokens.
+    await e.assemble({ sessionId: "s", messages: [...t1, ...turn(60_000, "t2")], tokenBudget: 7500 });
+
+    expect(mocked.compress).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks the proxy again when the history changed under its last count", async () => {
+    mocked.compress.mockImplementation(compressing);
+    const e = engine();
+    const t1 = turn(10 * MIN, "t1");
+    await e.assemble({ sessionId: "s", messages: t1 });
+
+    const rewritten = [{ ...t1[0], content: [{ type: "text", text: "summary of the earlier turns" }] }, ...t1.slice(1), ...turn(60_000, "t2")];
+    await e.assemble({ sessionId: "s", messages: rewritten, tokenBudget: 7500 });
+
+    expect(mocked.compress).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops an idle session's compressed view on any later assembly", async () => {
+    mocked.compress.mockImplementation(compressing);
+    const e = engine();
+    await e.assemble({ sessionId: "idle", messages: turn(10 * MIN, "t1") });
+    const views = (e as unknown as { compressedViews: Map<string, { usedAt: number }> }).compressedViews;
+    views.get("idle")!.usedAt -= 6 * MIN; // unused for longer than the window
+
+    // A warm turn in another session, which never reaches the proxy, still clears it out.
+    await e.assemble({ sessionId: "busy", messages: turn(60_000, "t2") });
+
+    expect(mocked.compress).toHaveBeenCalledTimes(1);
+    expect(views.has("idle")).toBe(false);
+  });
 });
