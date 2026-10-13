@@ -71,6 +71,8 @@ function jsonBytes(messages: any[]): number {
 interface TokenCount {
   /** Fingerprints of the messages counted, in order. */
   keys: string[];
+  /** The model counted for: the proxy picks its tokenizer by model. */
+  model: string;
   tokens: number;
   usedAt: number;
 }
@@ -198,6 +200,7 @@ export class HeadroomContextEngine {
   }> {
     this.evictIdle(params.sessionId);
     const warm = this.isCacheWarm(params.messages);
+    const model = params.model ?? "claude-sonnet-4-5";
 
     if (!this.proxyUrl || this.config.enabled === false) {
       this.ensureProxyStarted();
@@ -220,7 +223,7 @@ export class HeadroomContextEngine {
 
     // Warm cache and provably within budget: skip without calling the proxy, so it neither counts savings that
     // are never applied nor adds its latency. Otherwise ask the proxy and decide on its token count below.
-    if (warm && this.fitsBudget(params)) {
+    if (warm && this.fitsBudget(params, model)) {
       return {
         messages: this.unchanged(params, warm),
         estimatedTokens: 0,
@@ -235,14 +238,14 @@ export class HeadroomContextEngine {
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
       const result = await withTimeout(
         compress(openaiMessages, {
-          model: params.model ?? "claude-sonnet-4-5",
+          model,
           baseUrl: this.proxyUrl,
           fallback: true,
           tokenBudget: params.tokenBudget,
         } as any),
         this.config.requestTimeoutMs ?? 30_000,
       );
-      this.rememberTokenCount(params, result.tokensBefore);
+      this.rememberTokenCount(params, model, result.tokensBefore);
 
       if (!result.compressed || result.tokensSaved === 0) {
         this.resetCircuit();
@@ -351,24 +354,24 @@ export class HeadroomContextEngine {
 
   /**
    * True when the history can be shown to fit `tokenBudget` (or there is none) without asking the proxy. The
-   * bound is the proxy's own count from the last time it saw this history plus the size of any messages appended
-   * since, or failing that the size of the whole history (see `jsonBytes`).
+   * bound is the proxy's own count for `model` from the last time it saw this history plus the size of any
+   * messages appended since, or failing that the size of the whole history (see `jsonBytes`).
    */
-  private fitsBudget(params: { sessionId: string; messages: any[]; tokenBudget?: number }): boolean {
+  private fitsBudget(params: { sessionId: string; messages: any[]; tokenBudget?: number }, model: string): boolean {
     if (!params.tokenBudget) return true;
     const count = this.tokenCounts.get(params.sessionId);
-    if (count && startsWithKeys(params.messages, count.keys)) {
+    if (count && count.model === model && startsWithKeys(params.messages, count.keys)) {
       count.usedAt = Date.now();
       return count.tokens + jsonBytes(params.messages.slice(count.keys.length)) <= params.tokenBudget;
     }
     return jsonBytes(params.messages) <= params.tokenBudget;
   }
 
-  /** Record the proxy's token count for `params.messages`, for `fitsBudget`. */
-  private rememberTokenCount(params: { sessionId: string; messages: any[] }, tokens: number): void {
+  /** Record the proxy's token count for `params.messages` under `model`, for `fitsBudget`. */
+  private rememberTokenCount(params: { sessionId: string; messages: any[] }, model: string, tokens: number): void {
     // The SDK's fallback result (proxy unreachable) reports 0 tokens, which is not a count.
     if (!(this.cacheWindowMs() > 0) || !(tokens > 0)) return;
-    this.tokenCounts.set(params.sessionId, { keys: params.messages.map(messageKey), tokens, usedAt: Date.now() });
+    this.tokenCounts.set(params.sessionId, { keys: params.messages.map(messageKey), model, tokens, usedAt: Date.now() });
   }
 
   /**

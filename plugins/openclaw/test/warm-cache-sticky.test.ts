@@ -250,6 +250,18 @@ describe("the compressed history stays put while the prompt cache is warm", () =
     expect(mocked.compress).toHaveBeenCalledTimes(1);
   });
 
+  it("does not bound a warm history by a count the proxy made for another model", async () => {
+    mocked.compress.mockImplementation(compressing); // counts 2000 tokens
+    const e = engine();
+    const t1 = turn(10 * MIN, "t1");
+    await e.assemble({ sessionId: "s", messages: t1, model: "model-a" });
+
+    // The proxy's tokenizer depends on the model, so model-a's count says nothing about model-b's.
+    await e.assemble({ sessionId: "s", messages: [...t1, ...turn(60_000, "t2")], tokenBudget: 7500, model: "model-b" });
+
+    expect(mocked.compress).toHaveBeenCalledTimes(2);
+  });
+
   it("asks the proxy again when the history changed under its last count", async () => {
     mocked.compress.mockImplementation(compressing);
     const e = engine();
