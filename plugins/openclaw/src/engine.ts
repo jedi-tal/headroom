@@ -174,7 +174,7 @@ export class HeadroomContextEngine {
 
       const shouldAnnounceCompression =
         (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
-        this.config.announceCompression !== false;
+        this.config.announceCompression === true;
       if (shouldAnnounceCompression) {
         this.markCompressionAnnounced(params.sessionId);
       }
@@ -336,7 +336,7 @@ export class HeadroomContextEngine {
 
   /** The sticky notice if this session already earned it and announcements aren't opted out. */
   private sessionCompressionNotice(sessionId: string): string | undefined {
-    return this.hasAnnouncedCompression(sessionId) && this.config.announceCompression !== false
+    return this.hasAnnouncedCompression(sessionId) && this.config.announceCompression === true
       ? HEADROOM_COMPRESSION_NOTICE
       : undefined;
   }
