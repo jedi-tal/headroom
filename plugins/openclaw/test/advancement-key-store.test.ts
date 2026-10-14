@@ -7,7 +7,11 @@ import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { DurableAdvancementKeyStore, defaultCommitLogPath } from "../src/advancement-key-store.js";
+import {
+  DurableAdvancementKeyStore,
+  defaultCommitLogPath,
+  markerDirFor,
+} from "../src/advancement-key-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -23,9 +27,6 @@ const NODE_SUPPORTS_TRANSFORM_TYPES = (() => {
 })();
 
 const WORKER_PATH = fileURLToPath(new URL("./fixtures/commit-turn-worker.ts", import.meta.url));
-const HOLD_LOCK_WORKER_PATH = fileURLToPath(
-  new URL("./fixtures/hold-lock-worker.ts", import.meta.url),
-);
 
 /** Run the commit-turn worker as a real child process; returns its parsed JSON result. */
 async function runCommitWorker(
@@ -45,15 +46,10 @@ async function runCommitWorker(
   return JSON.parse(await fs.readFile(resultPath, "utf8"));
 }
 
-async function waitForFile(p: string): Promise<void> {
-  for (;;) {
-    try {
-      await fs.access(p);
-      return;
-    } catch {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-  }
+/** Every file under `dir`, recursively. */
+async function filesUnder(dir: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, { recursive: true, withFileTypes: true });
+  return entries.filter((e) => e.isFile()).map((e) => path.join(e.parentPath, e.name));
 }
 
 describe("DurableAdvancementKeyStore", () => {
@@ -69,54 +65,44 @@ describe("DurableAdvancementKeyStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("commits a new key and creates the parent directory", async () => {
+  it("commits a new key and creates the marker directory", async () => {
     const store = new DurableAdvancementKeyStore(storePath);
 
-    await expect(store.tryCommit("turn-1", [{ role: "user", content: "hi" }])).resolves.toBe(
-      "committed",
-    );
-    await expect(fs.stat(storePath)).resolves.toBeTruthy();
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
+    await expect(fs.stat(markerDirFor(storePath))).resolves.toBeTruthy();
   });
 
   it("reports duplicate for an already-committed key", async () => {
     const store = new DurableAdvancementKeyStore(storePath);
 
-    await expect(store.tryCommit("turn-1", [])).resolves.toBe("committed");
-    await expect(store.tryCommit("turn-1", [])).resolves.toBe("duplicate");
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
+    await expect(store.tryCommit("turn-1")).resolves.toBe("duplicate");
   });
 
   it("persists across a simulated restart (a fresh store instance, same path)", async () => {
     const before = new DurableAdvancementKeyStore(storePath);
-    await expect(before.tryCommit("turn-1", [])).resolves.toBe("committed");
+    await expect(before.tryCommit("turn-1")).resolves.toBe("committed");
 
     const after = new DurableAdvancementKeyStore(storePath);
-    await expect(after.tryCommit("turn-1", [])).resolves.toBe("duplicate");
+    await expect(after.tryCommit("turn-1")).resolves.toBe("duplicate");
     // A key that was never committed is still accepted normally.
-    await expect(after.tryCommit("turn-2", [])).resolves.toBe("committed");
+    await expect(after.tryCommit("turn-2")).resolves.toBe("committed");
   });
 
-  it("treats a missing commit-log file as an empty store rather than an error", async () => {
+  it("treats a store that doesn't exist yet as empty rather than an error", async () => {
     const store = new DurableAdvancementKeyStore(storePath);
 
     await expect(store.has("turn-1")).resolves.toBe(false);
-    await expect(store.tryCommit("turn-1", [])).resolves.toBe("committed");
-  });
-
-  it("fails loudly on a corrupt commit-log file instead of silently forgetting its contents", async () => {
-    await fs.mkdir(path.dirname(storePath), { recursive: true });
-    await fs.writeFile(storePath, "{not valid json", "utf8");
-    const store = new DurableAdvancementKeyStore(storePath);
-
-    await expect(store.tryCommit("turn-1", [])).rejects.toThrow();
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
   });
 
   it("serializes concurrent commits of the same key so exactly one wins", async () => {
     const store = new DurableAdvancementKeyStore(storePath);
 
     const results = await Promise.all([
-      store.tryCommit("turn-race", []),
-      store.tryCommit("turn-race", []),
-      store.tryCommit("turn-race", []),
+      store.tryCommit("turn-race"),
+      store.tryCommit("turn-race"),
+      store.tryCommit("turn-race"),
     ]);
 
     expect(results.filter((r) => r === "committed")).toHaveLength(1);
@@ -129,98 +115,153 @@ describe("DurableAdvancementKeyStore", () => {
       const store = new DurableAdvancementKeyStore(storePath);
 
       for (let i = 0; i < 600; i++) {
-        await store.tryCommit(`turn-${i}`, []);
+        await store.tryCommit(`turn-${i}`);
       }
 
-      await expect(store.tryCommit("turn-0", [])).resolves.toBe("duplicate");
+      await expect(store.tryCommit("turn-0")).resolves.toBe("duplicate");
     },
     20_000,
   );
 
-  // ---------------------------------------------------------------------
-  // PR #3442 review, round 2: three additional atomic-commit failures.
-  // ---------------------------------------------------------------------
-
-  it("persists the accepted messages together with the key, not just the key", async () => {
+  it("records each commit as one small marker holding only the key", async () => {
     const store = new DurableAdvancementKeyStore(storePath);
-    const messages = [
-      { role: "user", content: "what's the weather?" },
-      { role: "assistant", content: "Let me check." },
-    ];
 
-    await store.tryCommit("turn-1", messages);
+    await store.tryCommit("turn-1");
 
-    const entry = await store.get("turn-1");
-    expect(entry).toBeDefined();
-    expect(entry?.messages).toEqual(messages);
-    expect(typeof entry?.committedAt).toBe("string");
-    expect(entry?.committedAt.length).toBeGreaterThan(0);
+    const files = await filesUnder(markerDirFor(storePath));
+    expect(files).toHaveLength(1);
+    const record = JSON.parse(await fs.readFile(files[0], "utf8"));
+    expect(record.advancementKey).toBe("turn-1");
+    expect(typeof record.committedAt).toBe("string");
+    expect((await fs.stat(files[0])).size).toBeLessThan(200);
+  });
 
-    // Survives a restart too -- the messages aren't an in-memory-only echo.
-    const after = new DurableAdvancementKeyStore(storePath);
-    const reloaded = await after.get("turn-1");
-    expect(reloaded?.messages).toEqual(messages);
+  it("never rewrites an earlier commit's record when later keys are committed", async () => {
+    // Regression: every commit used to re-read and rewrite one file holding every
+    // key so far, so a commit's cost grew with the number of turns ever committed.
+    const store = new DurableAdvancementKeyStore(storePath);
+    await store.tryCommit("turn-0");
+    const [first] = await filesUnder(markerDirFor(storePath));
+    const before = await fs.stat(first);
+
+    for (let i = 1; i <= 50; i++) {
+      await store.tryCommit(`turn-${i}`);
+    }
+
+    const after = await fs.stat(first);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
   });
 
   it("does not remember a key when storage is inaccessible, so a retry can still succeed", async () => {
-    // Block the parent directory with a file. Both the commit's initial
-    // read and a membership lookup must propagate the filesystem error.
+    // Block the parent directory with a file. Both a commit and a membership
+    // lookup must propagate the filesystem error.
     const blockedParent = path.join(dir, "blocked");
     await fs.writeFile(blockedParent, "not a directory", "utf8");
     const blockedPath = path.join(blockedParent, "commit-log.json");
     const store = new DurableAdvancementKeyStore(blockedPath);
 
-    await expect(store.tryCommit("turn-1", [])).rejects.toThrow();
-    // The failed write must not be remembered in memory: retrying the same
-    // key must attempt the commit again (and fail again, for the same
-    // reason) rather than silently reporting "duplicate" for a commit that
-    // never reached disk.
-    await expect(store.tryCommit("turn-1", [])).rejects.toThrow();
+    // The error names the setting that fixes it.
+    await expect(store.tryCommit("turn-1")).rejects.toThrow(/HEADROOM_WORKSPACE_DIR/);
+    // The failed write must not be remembered: retrying the same key must
+    // attempt the commit again (and fail again, for the same reason) rather
+    // than report "duplicate" for a commit that never reached disk.
+    await expect(store.tryCommit("turn-1")).rejects.toThrow();
     await expect(store.has("turn-1")).rejects.toThrow();
 
-    // Once the underlying problem is fixed, the key is still absent and
-    // the same key commits normally.
+    // Once the underlying problem is fixed, the key is still absent and the
+    // same key commits normally.
     await fs.rm(blockedParent, { force: true });
     await expect(store.has("turn-1")).resolves.toBe(false);
-    await expect(store.tryCommit("turn-1", [])).resolves.toBe("committed");
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
     await expect(store.has("turn-1")).resolves.toBe(true);
   });
 
-  it("serializes across store instances sharing the same file, not only within one object", async () => {
+  it("is never blocked by a lock file a crashed process left behind", async () => {
+    // Regression: the previous store serialized commits with `<path>.lock` and,
+    // by design, never reclaimed it, so a gateway killed mid-commit left every
+    // later commit waiting 60 seconds and then failing until someone deleted it.
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(`${storePath}.lock`, "4242-1-abc\n4242\n2026-10-14T00:00:00.000Z\n", "utf8");
+    const store = new DurableAdvancementKeyStore(storePath);
+
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
+  }, 5_000);
+
+  it("commits through store instances sharing the same directory, not only within one object", async () => {
     const storeA = new DurableAdvancementKeyStore(storePath);
     const storeB = new DurableAdvancementKeyStore(storePath);
 
-    // Interleaved commits through two independent instances against the
-    // same file must not lose either one to a read-modify-write race.
-    const [resultA, resultB] = await Promise.all([
-      storeA.tryCommit("turn-a", ["from a"]),
-      storeB.tryCommit("turn-b", ["from b"]),
-    ]);
+    const [resultA, resultB] = await Promise.all([storeA.tryCommit("turn-a"), storeB.tryCommit("turn-b")]);
 
     expect(resultA).toBe("committed");
     expect(resultB).toBe("committed");
 
     // A third, fresh instance (simulating a restart) must see both.
     const after = new DurableAdvancementKeyStore(storePath);
-    await expect(after.has("turn-a")).resolves.toBe(true);
-    await expect(after.has("turn-b")).resolves.toBe(true);
-    await expect(after.tryCommit("turn-a", [])).resolves.toBe("duplicate");
-    await expect(after.tryCommit("turn-b", [])).resolves.toBe("duplicate");
+    await expect(after.tryCommit("turn-a")).resolves.toBe("duplicate");
+    await expect(after.tryCommit("turn-b")).resolves.toBe("duplicate");
+  });
+
+  describe("a commit log written by an earlier version", () => {
+    async function writeLegacyLog(contents: unknown): Promise<void> {
+      await fs.mkdir(path.dirname(storePath), { recursive: true });
+      await fs.writeFile(storePath, JSON.stringify(contents), "utf8");
+    }
+
+    it("keeps its keys committed and retires the file", async () => {
+      await writeLegacyLog({
+        "turn-old": { messages: [{ role: "user", content: "hi" }], committedAt: "2026-10-01T00:00:00.000Z" },
+      });
+      const store = new DurableAdvancementKeyStore(storePath);
+
+      await expect(store.tryCommit("turn-old")).resolves.toBe("duplicate");
+      await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
+      await expect(fs.access(storePath)).rejects.toThrow();
+      await expect(fs.access(`${storePath}.migrated`)).resolves.toBeUndefined();
+    });
+
+    it("reads the key-only array format too", async () => {
+      await writeLegacyLog(["turn-a", "turn-b"]);
+      const store = new DurableAdvancementKeyStore(storePath);
+
+      await expect(store.tryCommit("turn-a")).resolves.toBe("duplicate");
+      await expect(store.tryCommit("turn-b")).resolves.toBe("duplicate");
+    });
+
+    it("is migrated before the first commit of every store, so no store re-accepts a legacy key", async () => {
+      await writeLegacyLog({ "turn-old": { messages: [], committedAt: "" } });
+
+      const results = await Promise.all([
+        new DurableAdvancementKeyStore(storePath).tryCommit("turn-old"),
+        new DurableAdvancementKeyStore(storePath).tryCommit("turn-old"),
+      ]);
+
+      expect(results).toEqual(["duplicate", "duplicate"]);
+    });
+
+    it("fails loudly when corrupt instead of silently forgetting its keys", async () => {
+      await fs.mkdir(path.dirname(storePath), { recursive: true });
+      await fs.writeFile(storePath, "{not valid json", "utf8");
+      const store = new DurableAdvancementKeyStore(storePath);
+
+      await expect(store.tryCommit("turn-1")).rejects.toThrow();
+      // Fixing the file lets the same store recover without a restart.
+      await fs.writeFile(storePath, JSON.stringify(["turn-1"]), "utf8");
+      await expect(store.tryCommit("turn-1")).resolves.toBe("duplicate");
+    });
   });
 
   // -------------------------------------------------------------------
-  // PR #3442 review, round 3: an in-process lock (a JS Map/promise queue)
-  // does nothing to stop two separate OS processes -- e.g. two gateway
-  // processes sharing one Headroom workspace -- from racing the same
-  // commit-log file. These spawn the real DurableAdvancementKeyStore in
-  // real child processes (not Worker threads, which share the parent's
-  // memory and wouldn't exercise inter-process file locking) and release
-  // them via a shared "go" file so their read/check/write transactions
-  // contend for the file lock as close to simultaneously as possible.
+  // Two separate OS processes -- e.g. two gateway processes sharing one
+  // Headroom workspace -- committing at the same moment. These spawn the
+  // real DurableAdvancementKeyStore in real child processes (not Worker
+  // threads, which share the parent's memory) and release them via a shared
+  // "go" file so their commits race as closely as possible.
   // -------------------------------------------------------------------
 
   it.skipIf(!NODE_SUPPORTS_TRANSFORM_TYPES)(
-    "serializes commits from two separate OS processes sharing the same file",
+    "keeps commits from two separate OS processes sharing the same directory",
     async () => {
       const goPath = path.join(dir, "go");
       const resultAPath = path.join(dir, "result-a.json");
@@ -238,7 +279,6 @@ describe("DurableAdvancementKeyStore", () => {
       expect(resultA).toEqual({ status: "committed" });
       expect(resultB).toEqual({ status: "committed" });
 
-      // Neither commit was lost to a cross-process race.
       const after = new DurableAdvancementKeyStore(storePath);
       await expect(after.has("turn-a")).resolves.toBe(true);
       await expect(after.has("turn-b")).resolves.toBe(true);
@@ -260,64 +300,12 @@ describe("DurableAdvancementKeyStore", () => {
 
       const [resultA, resultB] = await Promise.all([workerA, workerB]);
 
-      // Exactly one process's transaction should win the race and see
-      // "committed"; the other must see "duplicate", never both
-      // "committed" (which would mean the file lock let them interleave).
+      // Exactly one process creates the marker and sees "committed"; the
+      // other must see "duplicate", never both "committed".
       const statuses = [resultA.status, resultB.status].sort();
       expect(statuses).toEqual(["committed", "duplicate"]);
     },
     30_000,
-  );
-
-  it.skipIf(!NODE_SUPPORTS_TRANSFORM_TYPES)(
-    "never lets a second writer commit while a live holder still holds the lock",
-    async () => {
-      // Regression for PR #3442 review, round 4: a lock reclaimed on an
-      // age-based staleness guess let a second process commit and release
-      // while the first (merely slow, not dead) holder still believed it
-      // owned the lock -- the first then resumed and overwrote the
-      // second's accepted commit with its own stale snapshot. This proves
-      // the invariant that replaces that heuristic: a second writer must
-      // never proceed while ANY holder -- however long it takes -- still
-      // holds the lock. Deterministic and fast: the "holder" is a worker
-      // that occupies the real lock file and only releases it when told
-      // to, rather than relying on a real multi-second sleep.
-      const readyPath = path.join(dir, "holder-ready");
-      const releasePath = path.join(dir, "holder-release");
-
-      const holder = execFileAsync(process.execPath, [
-        "--experimental-transform-types",
-        HOLD_LOCK_WORKER_PATH,
-        storePath,
-        readyPath,
-        releasePath,
-      ]);
-
-      // Wait until the holder has actually acquired the lock before racing
-      // a commit against it.
-      await waitForFile(readyPath);
-
-      const store = new DurableAdvancementKeyStore(storePath);
-      let secondCommitSettled = false;
-      const secondCommit = store.tryCommit("turn-b", ["b"]).finally(() => {
-        secondCommitSettled = true;
-      });
-
-      // Give the second commit ample opportunity to (wrongly) proceed
-      // while the holder is still alive and has not released.
-      try {
-        await new Promise((r) => setTimeout(r, 500));
-        expect(secondCommitSettled).toBe(false);
-      } finally {
-        // Release even if the assertion fails, so the child cannot leak.
-        await fs.writeFile(releasePath, "go", "utf8");
-        await holder;
-      }
-      // The second commit must now complete successfully, with nothing lost.
-      await expect(secondCommit).resolves.toBe("committed");
-      await expect(store.has("turn-b")).resolves.toBe(true);
-    },
-    15_000,
   );
 });
 
@@ -345,6 +333,12 @@ describe("defaultCommitLogPath", () => {
 
     expect(defaultCommitLogPath()).toBe(
       path.join(os.homedir(), ".headroom", "openclaw", "commit-log.json"),
+    );
+  });
+
+  it("keeps the markers beside the commit log", () => {
+    expect(markerDirFor(path.join("/w", "openclaw", "commit-log.json"))).toBe(
+      path.join("/w", "openclaw", "commit-log.d"),
     );
   });
 });
