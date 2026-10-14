@@ -168,6 +168,9 @@ export class HeadroomContextEngine {
           baseUrl: this.proxyUrl,
           fallback: true,
           tokenBudget: params.tokenBudget,
+          // Session mode (#3270): the proxy returns everything it returned for this session before
+          // byte-identical and compresses only new messages, so it never re-writes a cached prefix.
+          config: { sessionId: params.sessionId },
         } as any),
         this.config.requestTimeoutMs ?? 30_000,
       );

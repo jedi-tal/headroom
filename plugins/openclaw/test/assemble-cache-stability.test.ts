@@ -178,6 +178,14 @@ describe("assemble() keeps the provider prompt cache", () => {
     expect(messages[1].content[2].arguments).toEqual({ command: "kubectl get pods" });
   });
 
+  it("asks the proxy to keep the session's compressed prefix byte-identical", async () => {
+    mocked.compress.mockImplementation(async (messages: any[]) => compressToolResults(messages));
+
+    await engine().assemble({ sessionId: "s", messages: history() });
+
+    expect(mocked.compress).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ config: { sessionId: "s" } }));
+  });
+
   it("never leaks its bookkeeping into the messages it returns", async () => {
     mocked.compress.mockImplementation(async (messages: any[]) => compressToolResults(messages));
 
