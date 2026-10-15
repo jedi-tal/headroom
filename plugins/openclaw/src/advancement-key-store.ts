@@ -39,7 +39,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as os from "node:os";
 
@@ -174,6 +174,9 @@ export class DurableAdvancementKeyStore {
       if (code === "ENOENT" || code === "ENOTDIR") {
         return; // No legacy log. A blocked path fails loudly at the first commit.
       }
+      if ((code === "EACCES" || code === "EPERM") && (await this.isMigratedLog())) {
+        return; // Unreadable now, but every key it held has a marker, and it hasn't changed since.
+      }
       throw error;
     }
     let version: LegacyLogVersion;
@@ -227,6 +230,17 @@ export class DurableAdvancementKeyStore {
         throw this.storageError(recordError);
       }
       this.migratedVersion = version;
+    }
+  }
+
+  /** Whether the log's metadata alone identifies it as the version already migrated. */
+  private async isMigratedLog(): Promise<boolean> {
+    try {
+      const { size, mtimeMs, ino } = await stat(this.path);
+      this.migratedVersion ??= await this.readMigratedLogRecord();
+      return sameVersion(this.migratedVersion, { size, mtimeMs, ino });
+    } catch {
+      return false;
     }
   }
 

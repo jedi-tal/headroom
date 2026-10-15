@@ -306,6 +306,10 @@ describe("DurableAdvancementKeyStore", () => {
           const restarted = new DurableAdvancementKeyStore(storePath);
           await expect(restarted.tryCommit("turn-next")).resolves.toBe("committed");
 
+          // Nor does a migrated log that can no longer be read block commits.
+          await fs.chmod(storePath, 0o000);
+          await expect(new DurableAdvancementKeyStore(storePath).tryCommit("turn-c")).resolves.toBe("committed");
+
           // The directory becomes writable, and an older version that is still
           // running commits turn-b the way it always did (temp file + rename).
           // The running store migrates it before its next commit, and can now
