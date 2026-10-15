@@ -282,11 +282,11 @@ describe("DurableAdvancementKeyStore", () => {
 
     // Permission bits don't stop root, and Windows doesn't apply them to directories.
     it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
-      "still lets commits through when the log's directory is read-only, and migrates the log again only once it changes",
+      "keeps commits working while the log's directory is read-only, and migrates what an older version adds later",
       async () => {
         // A writable marker volume mounted beneath a read-only directory that
         // holds the legacy log: its keys migrate, but the log can't be renamed.
-        await writeLegacyLog({ "turn-old": { messages: [], committedAt: "" } });
+        await writeLegacyLog({ "turn-a": { messages: [], committedAt: "" } });
         const written = new Date("2026-10-01T00:00:00.000Z");
         await fs.utimes(storePath, written, written);
         const logDir = path.dirname(storePath);
@@ -294,10 +294,10 @@ describe("DurableAdvancementKeyStore", () => {
         await fs.chmod(logDir, 0o555);
         try {
           const store = new DurableAdvancementKeyStore(storePath);
-          await expect(store.tryCommit("turn-old")).resolves.toBe("duplicate");
+          await expect(store.tryCommit("turn-a")).resolves.toBe("duplicate");
           await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
           const log = await fs.readFile(storePath, "utf8");
-          expect(log).toContain("turn-old");
+          expect(log).toContain("turn-a");
 
           // A restart doesn't read the unchanged log again. Probe: contents that
           // can't be parsed, at the same size and mtime.
@@ -306,14 +306,20 @@ describe("DurableAdvancementKeyStore", () => {
           const restarted = new DurableAdvancementKeyStore(storePath);
           await expect(restarted.tryCommit("turn-next")).resolves.toBe("committed");
 
-          // A log that changed since (an older version wrote another key) is migrated again.
+          // The directory becomes writable, and an older version that is still
+          // running commits turn-b the way it always did (temp file + rename).
+          // The running store migrates it before its next commit, and can now
+          // retire the log.
+          await fs.chmod(logDir, 0o755);
+          const temp = `${storePath}.tmp`;
           await fs.writeFile(
-            storePath,
-            JSON.stringify({ "turn-old": { committedAt: "" }, "turn-later": { committedAt: "" } }),
+            temp,
+            JSON.stringify({ "turn-a": { committedAt: "" }, "turn-b": { committedAt: "" } }),
             "utf8",
           );
-          const later = new DurableAdvancementKeyStore(storePath);
-          await expect(later.tryCommit("turn-later")).resolves.toBe("duplicate");
+          await fs.rename(temp, storePath);
+          await expect(restarted.tryCommit("turn-b")).resolves.toBe("duplicate");
+          await expect(fs.access(`${storePath}.migrated`)).resolves.toBeUndefined();
         } finally {
           await fs.chmod(logDir, 0o755);
         }
