@@ -287,6 +287,8 @@ describe("DurableAdvancementKeyStore", () => {
         // A writable marker volume mounted beneath a read-only directory that
         // holds the legacy log: its keys migrate, but the log can't be renamed.
         await writeLegacyLog({ "turn-old": { messages: [], committedAt: "" } });
+        const written = new Date("2026-10-01T00:00:00.000Z");
+        await fs.utimes(storePath, written, written);
         const logDir = path.dirname(storePath);
         await fs.mkdir(markerDirFor(storePath));
         await fs.chmod(logDir, 0o555);
@@ -294,15 +296,17 @@ describe("DurableAdvancementKeyStore", () => {
           const store = new DurableAdvancementKeyStore(storePath);
           await expect(store.tryCommit("turn-old")).resolves.toBe("duplicate");
           await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
-          await expect(fs.access(storePath)).resolves.toBeUndefined();
+          const log = await fs.readFile(storePath, "utf8");
+          expect(log).toContain("turn-old");
 
-          // A restart doesn't read the unchanged log again: it can't even be read now.
-          await fs.chmod(storePath, 0o000);
+          // A restart doesn't read the unchanged log again. Probe: contents that
+          // can't be parsed, at the same size and mtime.
+          await fs.writeFile(storePath, "x".repeat(log.length), "utf8");
+          await fs.utimes(storePath, written, written);
           const restarted = new DurableAdvancementKeyStore(storePath);
           await expect(restarted.tryCommit("turn-next")).resolves.toBe("committed");
 
           // A log that changed since (an older version wrote another key) is migrated again.
-          await fs.chmod(storePath, 0o644);
           await fs.writeFile(
             storePath,
             JSON.stringify({ "turn-old": { committedAt: "" }, "turn-later": { committedAt: "" } }),
@@ -312,7 +316,6 @@ describe("DurableAdvancementKeyStore", () => {
           await expect(later.tryCommit("turn-later")).resolves.toBe("duplicate");
         } finally {
           await fs.chmod(logDir, 0o755);
-          await fs.chmod(storePath, 0o644);
         }
       },
     );

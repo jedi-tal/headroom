@@ -39,7 +39,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as os from "node:os";
 
@@ -162,10 +162,9 @@ export class DurableAdvancementKeyStore {
    * before its own first commit, so a legacy key is never re-accepted.
    */
   private async migrateLegacyLog(): Promise<void> {
-    let version: LegacyLogVersion;
+    let log: FileHandle;
     try {
-      const { size, mtimeMs, ino } = await stat(this.path);
-      version = { size, mtimeMs, ino };
+      log = await open(this.path, "r");
     } catch (error) {
       const code = errorCode(error);
       if (code === "ENOENT" || code === "ENOTDIR") {
@@ -173,17 +172,18 @@ export class DurableAdvancementKeyStore {
       }
       throw error;
     }
-    if (sameVersion(await this.readMigratedLogRecord(), version)) {
-      return; // Migrated already, and unchanged since.
-    }
+    let version: LegacyLogVersion;
     let raw: string;
     try {
-      raw = await readFile(this.path, "utf8");
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") {
-        return; // Another process migrated the same log first.
+      // Version and contents come from the same open file, so they always match.
+      const { size, mtimeMs, ino } = await log.stat();
+      version = { size, mtimeMs, ino };
+      if (sameVersion(await this.readMigratedLogRecord(), version)) {
+        return; // Migrated already, and unchanged since.
       }
-      throw error;
+      raw = await log.readFile("utf8");
+    } finally {
+      await log.close();
     }
     // A corrupt log throws here rather than being treated as empty, which would
     // silently re-accept every key it held.
