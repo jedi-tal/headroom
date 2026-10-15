@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -50,6 +51,12 @@ async function runCommitWorker(
 async function filesUnder(dir: string): Promise<string[]> {
   const entries = await fs.readdir(dir, { recursive: true, withFileTypes: true });
   return entries.filter((e) => e.isFile()).map((e) => path.join(e.parentPath, e.name));
+}
+
+/** Where `key`'s marker lives: `<marker dir>/<first two hex digits of its sha256>/<sha256>`. */
+function markerPathFor(storePath: string, key: string): string {
+  const digest = createHash("sha256").update(key, "utf8").digest("hex");
+  return path.join(markerDirFor(storePath), digest.slice(0, 2), digest);
 }
 
 describe("DurableAdvancementKeyStore", () => {
@@ -177,6 +184,39 @@ describe("DurableAdvancementKeyStore", () => {
     await expect(store.has("turn-1")).resolves.toBe(true);
   });
 
+  // Regression: creating a marker's directory and creating the marker itself
+  // both fail with EEXIST, and both were read as "duplicate". A file where the
+  // shard directory belongs acknowledged a key that was never recorded.
+  it.each([
+    ["the marker directory", (storePath: string) => markerDirFor(storePath)],
+    ["the key's shard directory", (storePath: string) => path.dirname(markerPathFor(storePath, "turn-1"))],
+  ])("reports a file in place of %s as an error, never as a duplicate", async (_where, blockedPath) => {
+    const blocker = blockedPath(storePath);
+    await fs.mkdir(path.dirname(blocker), { recursive: true });
+    await fs.writeFile(blocker, "not a directory", "utf8");
+    const store = new DurableAdvancementKeyStore(storePath);
+
+    await expect(store.tryCommit("turn-1")).rejects.toThrow(/HEADROOM_WORKSPACE_DIR/);
+    await expect(store.tryCommit("turn-1")).rejects.toThrow(/HEADROOM_WORKSPACE_DIR/);
+
+    await fs.rm(blocker);
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
+    await expect(store.tryCommit("turn-1")).resolves.toBe("duplicate");
+  });
+
+  it("reports anything but a marker file at a marker's path as an error, never as a duplicate", async () => {
+    const marker = markerPathFor(storePath, "turn-1");
+    await fs.mkdir(marker, { recursive: true });
+    const store = new DurableAdvancementKeyStore(storePath);
+
+    await expect(store.tryCommit("turn-1")).rejects.toThrow(/HEADROOM_WORKSPACE_DIR/);
+    await expect(store.has("turn-1")).resolves.toBe(false);
+
+    await fs.rm(marker, { recursive: true });
+    await expect(store.tryCommit("turn-1")).resolves.toBe("committed");
+    await expect(store.has("turn-1")).resolves.toBe(true);
+  });
+
   it("is never blocked by a lock file a crashed process left behind", async () => {
     // Regression: the previous store serialized commits with `<path>.lock` and,
     // by design, never reclaimed it, so a gateway killed mid-commit left every
@@ -239,6 +279,43 @@ describe("DurableAdvancementKeyStore", () => {
 
       expect(results).toEqual(["duplicate", "duplicate"]);
     });
+
+    // Permission bits don't stop root, and Windows doesn't apply them to directories.
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "still lets commits through when the log's directory is read-only, and migrates the log again only once it changes",
+      async () => {
+        // A writable marker volume mounted beneath a read-only directory that
+        // holds the legacy log: its keys migrate, but the log can't be renamed.
+        await writeLegacyLog({ "turn-old": { messages: [], committedAt: "" } });
+        const logDir = path.dirname(storePath);
+        await fs.mkdir(markerDirFor(storePath));
+        await fs.chmod(logDir, 0o555);
+        try {
+          const store = new DurableAdvancementKeyStore(storePath);
+          await expect(store.tryCommit("turn-old")).resolves.toBe("duplicate");
+          await expect(store.tryCommit("turn-new")).resolves.toBe("committed");
+          await expect(fs.access(storePath)).resolves.toBeUndefined();
+
+          // A restart doesn't read the unchanged log again: it can't even be read now.
+          await fs.chmod(storePath, 0o000);
+          const restarted = new DurableAdvancementKeyStore(storePath);
+          await expect(restarted.tryCommit("turn-next")).resolves.toBe("committed");
+
+          // A log that changed since (an older version wrote another key) is migrated again.
+          await fs.chmod(storePath, 0o644);
+          await fs.writeFile(
+            storePath,
+            JSON.stringify({ "turn-old": { committedAt: "" }, "turn-later": { committedAt: "" } }),
+            "utf8",
+          );
+          const later = new DurableAdvancementKeyStore(storePath);
+          await expect(later.tryCommit("turn-later")).resolves.toBe("duplicate");
+        } finally {
+          await fs.chmod(logDir, 0o755);
+          await fs.chmod(storePath, 0o644);
+        }
+      },
+    );
 
     it("fails loudly when corrupt instead of silently forgetting its keys", async () => {
       await fs.mkdir(path.dirname(storePath), { recursive: true });

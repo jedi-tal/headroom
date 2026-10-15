@@ -29,16 +29,17 @@
  * already-committed turn -- exactly the failure this store exists to avoid. A
  * marker is a few dozen bytes.
  *
- * Nothing is cached in memory: a commit that fails before its marker exists
- * (an unwritable directory) is retried for real, never answered with a
- * phantom "duplicate". A marker is created before its contents are written, so
+ * Nothing is cached in memory, and only an existing marker file counts as a
+ * commit: a commit that fails before its marker exists (an unwritable or
+ * blocked directory) is retried for real, never answered with a phantom
+ * "duplicate". A marker is created before its contents are written, so
  * a failure after creation (a full disk) still leaves the key committed: the
  * caller sees the error, and its retry sees "duplicate" -- never a second
  * "committed".
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, rename, stat } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as os from "node:os";
 
@@ -59,6 +60,13 @@ function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException)?.code;
 }
 
+/** Identifies one version of a legacy log file: any rewrite changes at least one of these. */
+type LegacyLogVersion = { size: number; mtimeMs: number; ino: number };
+
+function sameVersion(a: LegacyLogVersion | undefined, b: LegacyLogVersion): boolean {
+  return a?.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
+}
+
 export class DurableAdvancementKeyStore {
   private readonly markerDir: string;
   private migration: Promise<void> | undefined;
@@ -67,7 +75,9 @@ export class DurableAdvancementKeyStore {
    * `path` names the commit log; the markers live in `markerDirFor(path)`.
    * Versions that kept every key in the log file itself may have left one at
    * `path`: its keys are migrated to markers before this store's first commit
-   * or lookup, and the file is then renamed to `<path>.migrated`.
+   * or lookup, and the file is then renamed to `<path>.migrated` -- or, if its
+   * directory is read-only, left in place and skipped for as long as it is
+   * unchanged.
    */
   constructor(private readonly path: string) {
     this.markerDir = markerDirFor(path);
@@ -79,30 +89,61 @@ export class DurableAdvancementKeyStore {
     return join(this.markerDir, digest.slice(0, 2), digest);
   }
 
+  /** Records which version of a legacy log was migrated but couldn't be renamed. */
+  private migratedLogRecordPath(): string {
+    return join(this.markerDir, "migrated-legacy-log.json");
+  }
+
+  private storageError(error: unknown): Error {
+    // Node reports a directory it can't create on a read-only filesystem as
+    // ENOENT, which reads like a bug rather than a setting -- say which one.
+    return new Error(
+      `Cannot record turn advancements under ${this.markerDir}: ${(error as Error)?.message ?? error}. ` +
+        "Point HEADROOM_WORKSPACE_DIR (or the plugin's commitLogPath) at a writable directory.",
+      { cause: error },
+    );
+  }
+
+  /** Whether a marker file -- not a directory or anything else -- exists at `marker`. */
+  private async isMarker(marker: string): Promise<boolean> {
+    try {
+      return (await lstat(marker)).isFile();
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   /** Create `key`'s marker; false if it already existed. */
   private async createMarker(key: string, committedAt: string): Promise<boolean> {
     const marker = this.markerPath(key);
     try {
       await mkdir(dirname(marker), { recursive: true });
-      const handle = await open(marker, "wx");
-      try {
-        await handle.writeFile(`${JSON.stringify({ advancementKey: key, committedAt })}\n`, "utf8");
-      } finally {
-        await handle.close();
-      }
-      return true;
     } catch (error) {
-      if (errorCode(error) === "EEXIST") {
+      // An EEXIST here means a file sits where the marker's directory belongs,
+      // so no marker can exist beneath it: broken storage, not a duplicate.
+      throw this.storageError(error);
+    }
+    let handle: FileHandle;
+    try {
+      handle = await open(marker, "wx");
+    } catch (error) {
+      // Only an existing marker file makes this a retry of a committed key.
+      if (errorCode(error) === "EEXIST" && (await this.isMarker(marker).catch(() => false))) {
         return false;
       }
-      // Node reports a directory it can't create on a read-only filesystem as
-      // ENOENT, which reads like a bug rather than a setting -- say which one.
-      throw new Error(
-        `Cannot record turn advancements under ${this.markerDir}: ${(error as Error)?.message ?? error}. ` +
-          "Point HEADROOM_WORKSPACE_DIR (or the plugin's commitLogPath) at a writable directory.",
-        { cause: error },
-      );
+      throw this.storageError(error);
     }
+    try {
+      await handle.writeFile(`${JSON.stringify({ advancementKey: key, committedAt })}\n`, "utf8");
+    } catch (error) {
+      throw this.storageError(error);
+    } finally {
+      await handle.close();
+    }
+    return true;
   }
 
   private ensureMigrated(): Promise<void> {
@@ -121,13 +162,26 @@ export class DurableAdvancementKeyStore {
    * before its own first commit, so a legacy key is never re-accepted.
    */
   private async migrateLegacyLog(): Promise<void> {
-    let raw: string;
+    let version: LegacyLogVersion;
     try {
-      raw = await readFile(this.path, "utf8");
+      const { size, mtimeMs, ino } = await stat(this.path);
+      version = { size, mtimeMs, ino };
     } catch (error) {
       const code = errorCode(error);
       if (code === "ENOENT" || code === "ENOTDIR") {
         return; // No legacy log. A blocked path fails loudly at the first commit.
+      }
+      throw error;
+    }
+    if (sameVersion(await this.readMigratedLogRecord(), version)) {
+      return; // Migrated already, and unchanged since.
+    }
+    let raw: string;
+    try {
+      raw = await readFile(this.path, "utf8");
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") {
+        return; // Another process migrated the same log first.
       }
       throw error;
     }
@@ -149,10 +203,32 @@ export class DurableAdvancementKeyStore {
     try {
       await rename(this.path, `${this.path}.migrated`);
     } catch (error) {
-      if (errorCode(error) !== "ENOENT") {
+      const code = errorCode(error);
+      if (code === "ENOENT") {
+        return; // Another process migrated the same log first.
+      }
+      if (code !== "EACCES" && code !== "EPERM" && code !== "EROFS") {
         throw error;
       }
-      // Another process migrated the same log first.
+      // The log's directory is read-only (say, a writable marker volume mounted
+      // beneath it), so the log stays. Every key it held has a marker now:
+      // record which version of the file that was, so later stores skip it
+      // while it is unchanged and migrate it again once anything -- an older
+      // version still writing to it -- changes it.
+      try {
+        await mkdir(this.markerDir, { recursive: true });
+        await writeFile(this.migratedLogRecordPath(), `${JSON.stringify(version)}\n`, "utf8");
+      } catch (recordError) {
+        throw this.storageError(recordError);
+      }
+    }
+  }
+
+  private async readMigratedLogRecord(): Promise<LegacyLogVersion | undefined> {
+    try {
+      return JSON.parse(await readFile(this.migratedLogRecordPath(), "utf8")) as LegacyLogVersion;
+    } catch {
+      return undefined; // None yet, or unreadable: migrating again is always safe.
     }
   }
 
@@ -171,14 +247,6 @@ export class DurableAdvancementKeyStore {
   /** Test-only: check membership without recording. */
   async has(key: string): Promise<boolean> {
     await this.ensureMigrated();
-    try {
-      await stat(this.markerPath(key));
-      return true;
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") {
-        return false;
-      }
-      throw error;
-    }
+    return this.isMarker(this.markerPath(key));
   }
 }
